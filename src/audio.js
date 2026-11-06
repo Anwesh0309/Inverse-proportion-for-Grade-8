@@ -7,8 +7,10 @@
      1. Pre-generated static mp3 (seg.file, from scripts/generate_audio.js)
      2. Dynamic ElevenLabs request (VITE_ELEVENLABS_API_KEY in .env.local)
      3. Browser speechSynthesis fallback (so narration never goes silent)
+
    Strict single-channel queuing ensures NO audio ever overlaps and any phase
    skip or user interaction immediately terminates the previous narration.
+   Only the active on-screen narration is played; skipped phases are immediately silenced.
    ========================================================================= */
 export const VOICE_ID = "Xb7hH8MSUJpSbSDYk0k2";
 export const MODEL_ID = "eleven_multilingual_v2";
@@ -64,6 +66,7 @@ export let audioMuted = false;
 let ttsVoice = null;
 let currentAudio = null;
 let currentQueueId = 0;
+let inFlightAbortController = null;
 
 function pickVoice() {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return null;
@@ -88,13 +91,13 @@ export function setMuted(m) {
   if (m) stopNarration();
 }
 
-/* ---------------- URL resolution: static file → ElevenLabs → null ---------------- */
+/* ---------------- URL resolution: static file -> ElevenLabs -> null ---------------- */
 const urlCache = new Map(); // text/file -> Promise<string|null>
 
-async function staticFileUrl(file) {
+async function staticFileUrl(file, signal) {
   if (!file) return null;
   try {
-    const res = await fetch(file, { method: 'GET' });
+    const res = await fetch(file, { method: 'GET', signal });
     const type = res.headers.get('content-type') || '';
     if (res.ok && !/html/i.test(type) && (res.status === 200 || res.status === 304)) {
       const blob = await res.blob();
@@ -106,12 +109,13 @@ async function staticFileUrl(file) {
   return null;
 }
 
-async function elevenLabsUrl(text, style) {
+async function elevenLabsUrl(text, style, signal) {
   if (!API_KEY) return null;
   const cfg = STYLE_SETTINGS[style] || STYLE_SETTINGS.statement;
   try {
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
       method: 'POST',
+      signal,
       headers: {
         'xi-api-key': API_KEY,
         'Content-Type': 'application/json',
@@ -136,30 +140,48 @@ async function elevenLabsUrl(text, style) {
   }
 }
 
-export function getAudioUrl(seg) {
+export function getAudioUrl(seg, signal) {
   if (!seg || !seg.text) return Promise.resolve(null);
   const cacheKey = seg.file || seg.text;
   if (!urlCache.has(cacheKey)) {
-    const p = (async () => (await staticFileUrl(seg.file)) || (await elevenLabsUrl(seg.text, seg.style)))();
+    const p = (async () => (await staticFileUrl(seg.file, signal)) || (await elevenLabsUrl(seg.text, seg.style, signal)))();
     urlCache.set(cacheKey, p);
     p.then(url => { if (!url) urlCache.delete(cacheKey); });
   }
   return urlCache.get(cacheKey);
 }
 
+/* Hard stop and cleanup of all narration channels (Audio + Web Speech API) */
 export function stopNarration() {
   currentQueueId++;
+
+  // Abort any in-flight HTTP requests from previous phase/narration
+  if (inFlightAbortController) {
+    try {
+      inFlightAbortController.abort();
+    } catch (e) {}
+    inFlightAbortController = null;
+  }
+
+  // Hard mute and kill active audio element
   if (currentAudio) {
     const el = currentAudio;
     currentAudio = null;
     try {
+      el.muted = true;
       el.pause();
       el.currentTime = 0;
+      el.onended = null;
+      el.onerror = null;
+      el.onpause = null;
+      el.onplay = null;
       el.src = '';
       el.removeAttribute('src');
       el.load();
     } catch (e) {}
   }
+
+  // Cancel any active SpeechSynthesis utterance
   if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
     try {
       window.speechSynthesis.cancel();
@@ -172,7 +194,17 @@ export function speakSegment(seg, queueId) {
     if (audioMuted || !seg || !seg.text) return resolve();
     if (queueId != null && queueId !== currentQueueId) return resolve();
 
-    const url = await getAudioUrl(seg);
+    // Setup an AbortController for this segment's fetch requests
+    inFlightAbortController = new AbortController();
+    const signal = inFlightAbortController.signal;
+
+    let url = null;
+    try {
+      url = await getAudioUrl(seg, signal);
+    } catch (e) {
+      // Aborted or fetch error
+    }
+
     if (queueId != null && queueId !== currentQueueId) return resolve();
     if (audioMuted) return resolve();
 
@@ -182,8 +214,12 @@ export function speakSegment(seg, queueId) {
           const old = currentAudio;
           currentAudio = null;
           try {
+            old.muted = true;
             old.pause();
             old.currentTime = 0;
+            old.onended = null;
+            old.onerror = null;
+            old.onpause = null;
             old.src = '';
             old.load();
           } catch (e) {}
@@ -209,14 +245,18 @@ export function speakSegment(seg, queueId) {
             done();
           }
         };
-        audio.onerror = () => {
+        audio.onerror = (err) => {
           if (queueId !== currentQueueId) return done();
           fallbackSpeech(seg, queueId).then(done);
         };
 
         const playPromise = audio.play();
         if (playPromise !== undefined) {
-          playPromise.catch(() => {
+          playPromise.catch((err) => {
+            // AbortError is triggered when pause() is intentionally called on navigation/skip
+            if (err && (err.name === 'AbortError' || err.code === 20)) {
+              return done();
+            }
             if (queueId !== currentQueueId) return done();
             fallbackSpeech(seg, queueId).then(done);
           });
@@ -272,7 +312,7 @@ export async function narrate(segments, autoplay = true) {
   }
 }
 
-/* Warm the cache for a list of AUDIO_MAP entries (called once on first interaction) */
+/* Warm the cache for a list of AUDIO_MAP entries (called on user interaction) */
 export function preloadAudio(entries) {
   entries.forEach(e => {
     if (e) getAudioUrl(e);

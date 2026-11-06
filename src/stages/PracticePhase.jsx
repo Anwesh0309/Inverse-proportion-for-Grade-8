@@ -233,7 +233,7 @@ export function PracticeQuiz({ worldIndex, muted, addXp, onFinish }) {
         }
       }
       // If updatedLives <= 0, popup closes and Out of Hearts screen stays displayed!
-    }, 1000);
+    }, 1750);
   };
 
   const isGameOver = lives <= 0;

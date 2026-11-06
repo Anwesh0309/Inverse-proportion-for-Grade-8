@@ -342,6 +342,7 @@ export function SimulatePhase({ muted, onNext }) {
                 <button
                   key={st.n}
                   onClick={() => {
+                    stopNarration();
                     setStation(st.n);
                     setActIdx(0);
                   }}
@@ -369,7 +370,10 @@ export function SimulatePhase({ muted, onNext }) {
 
             {/* Bottom Left CTA Button */}
             <button
-              onClick={onNext}
+              onClick={() => {
+                stopNarration();
+                if (onNext) onNext();
+              }}
               className="btn-gold font-display font-900 text-base sm:text-lg py-4 px-6 shadow-[0_0_25px_rgba(250,204,21,0.65)] hover:scale-105 transition mt-2 w-full flex items-center justify-center gap-2 cursor-pointer shrink-0"
             >
               <span>Go to Practice Phase!</span>

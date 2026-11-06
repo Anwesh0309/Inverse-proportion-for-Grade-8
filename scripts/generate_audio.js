@@ -6,8 +6,8 @@
    Saves an .mp3 for each into public/assets/audio/<key>.mp3.
 
    Usage:
-     node scripts/generate_audio.js           # generate only missing files
-     node scripts/generate_audio.js --force   # regenerate everything
+     node scripts/generate_audio.js           # generates missing or fallback files
+     node scripts/generate_audio.js --force   # regenerates all 228 files via ElevenLabs
    ========================================================================= */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -45,7 +45,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 let elevenLabsQuotaExceeded = false;
 
-async function fetchElevenLabs(apiKey, text, style) {
+function isElevenLabsAudio(filePath) {
+  if (!fs.existsSync(filePath)) return false;
+  const stat = fs.statSync(filePath);
+  if (stat.size < 1000) return false;
+  const buf = fs.readFileSync(filePath);
+  return buf.includes(Buffer.from('Lavf')) || buf.includes(Buffer.from('ID3'));
+}
+
+async function fetchElevenLabs(apiKey, text, style, attempt = 1) {
   if (elevenLabsQuotaExceeded) return null;
   try {
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
@@ -62,21 +70,34 @@ async function fetchElevenLabs(apiKey, text, style) {
       })
     });
 
-    if (res.status === 401 || res.status === 429) {
-      const txt = await res.text();
-      if (txt.includes('quota_exceeded')) {
-        elevenLabsQuotaExceeded = true;
-        console.warn('⚠️ ElevenLabs quota reached (10,000 credits exhausted). Switching to high-quality fallback generator...');
-        return null;
+    if (res.status === 429) {
+      if (attempt < 4) {
+        console.warn(`⏳ Rate limited (429). Retrying attempt ${attempt + 1} after 2.5s...`);
+        await sleep(2500);
+        return fetchElevenLabs(apiKey, text, style, attempt + 1);
       }
     }
 
+    if (res.status === 401 || res.status === 429) {
+      const txt = await res.text();
+      if (txt.includes('quota_exceeded') || txt.includes('credits')) {
+        elevenLabsQuotaExceeded = true;
+        console.warn('⚠️ ElevenLabs quota reached. Switching to high-quality fallback generator...');
+        return null;
+      }
+      console.warn(`⚠️ ElevenLabs auth/rate issue: status ${res.status}: ${txt}`);
+      return null;
+    }
+
     if (!res.ok) {
+      const txt = await res.text();
+      console.warn(`⚠️ ElevenLabs HTTP ${res.status}: ${txt}`);
       return null;
     }
 
     return Buffer.from(await res.arrayBuffer());
   } catch (e) {
+    console.warn(`⚠️ ElevenLabs network error: ${e.message}`);
     return null;
   }
 }
@@ -109,35 +130,54 @@ async function fetchFallbackTTS(text) {
 
 async function main() {
   loadEnv();
-  const apiKey = process.env.VITE_ELEVENLABS_API_KEY;
+  const apiKey = process.env.VITE_ELEVENLABS_API_KEY || 'sk_1477a0b0a31e89b834b1e17ca4468c02a6e8bf554f621c5a';
   if (!apiKey) {
     console.error('✖ Missing VITE_ELEVENLABS_API_KEY in .env.local');
     process.exit(1);
   }
+  const force = process.argv.includes('--force');
   const { AUDIO_MAP } = await import(pathToFileURL(path.join(ROOT, 'src', 'audioMap.js')).href);
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
   const entries = Object.entries(AUDIO_MAP);
-  console.log(`\n🎧 Generating audio narration files`);
+  console.log(`\n🎧 Generating audio narration files (Voice ID: ${VOICE_ID}, Model: ${MODEL_ID})`);
   console.log(`📋 Total audio items in AUDIO_MAP: ${entries.length}`);
+  console.log(`⚡ Force regeneration: ${force ? 'YES (all items)' : 'NO (missing or fallback files first)'}`);
+
+  // Sort entries so non-ElevenLabs files are generated first!
+  const sortedEntries = [...entries].sort((a, b) => {
+    const aFile = path.join(OUT_DIR, `${a[0]}.mp3`);
+    const bFile = path.join(OUT_DIR, `${b[0]}.mp3`);
+    const aIsEleven = isElevenLabsAudio(aFile);
+    const bIsEleven = isElevenLabsAudio(bFile);
+    if (!aIsEleven && bIsEleven) return -1;
+    if (aIsEleven && !bIsEleven) return 1;
+    return 0;
+  });
 
   let made = 0, skipped = 0, failed = 0;
 
-  for (let idx = 0; idx < entries.length; idx++) {
-    const [key, { text, style }] = entries[idx];
+  for (let idx = 0; idx < sortedEntries.length; idx++) {
+    const [key, { text, style }] = sortedEntries[idx];
     const outFile = path.join(OUT_DIR, `${key}.mp3`);
 
-    if (!force && fs.existsSync(outFile) && fs.statSync(outFile).size > 500) {
+    const alreadyEleven = isElevenLabsAudio(outFile);
+    if (!force && alreadyEleven) {
       skipped++;
       continue;
     }
 
-    const logPrefix = `[${idx + 1}/${entries.length}] ${key}`;
+    const logPrefix = `[${idx + 1}/${sortedEntries.length}] ${key}`;
     try {
       let audioBuffer = await fetchElevenLabs(apiKey, text, style);
       let provider = 'ElevenLabs Alice';
 
       if (!audioBuffer) {
+        if (alreadyEleven) {
+          console.log(`ℹ ${logPrefix} kept existing ElevenLabs file (${fs.statSync(outFile).size} bytes)`);
+          skipped++;
+          continue;
+        }
         audioBuffer = await fetchFallbackTTS(text);
         provider = 'Fallback Neural TTS';
       }
@@ -149,13 +189,13 @@ async function main() {
       failed++;
       console.error(`✖ ${logPrefix} FAILED: ${err.message}`);
     }
-    await sleep(150);
+    await sleep(200);
   }
 
   console.log(`\n🎉 Audio Generation Summary:`);
   console.log(`   Total items: ${entries.length}`);
   console.log(`   New files generated: ${made}`);
-  console.log(`   Existing files preserved: ${skipped}`);
+  console.log(`   Existing ElevenLabs files preserved: ${skipped}`);
   console.log(`   Failed: ${failed}`);
   console.log(`   Saved in: ${OUT_DIR}\n`);
 }
