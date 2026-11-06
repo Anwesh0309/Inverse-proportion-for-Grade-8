@@ -148,10 +148,11 @@ export function StoryPhase({ muted, onDone, onSlideChange }) {
 
           {/* Mascot Speech Bubble Pill */}
           <div className="flex items-center gap-4 w-full mt-1">
-            <div className="w-16 h-16 rounded-full bg-amber-400 flex items-center justify-center text-4xl shadow-lg shrink-0">
-              🦁
+            <div className="w-16 h-16 rounded-full bg-amber-400 flex items-center justify-center text-4xl shadow-lg shrink-0" title="Maya">
+              👧
             </div>
             <div className="bg-white text-[#0c031d] rounded-2xl px-7 py-3.5 font-display font-900 text-lg sm:text-xl shadow-xl flex-1 text-left leading-snug">
+              <span className="text-purple-900 text-xs font-black uppercase tracking-wider block mb-0.5">Maya's Insight</span>
               {slide.bubble}
             </div>
           </div>
